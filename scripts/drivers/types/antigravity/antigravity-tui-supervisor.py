@@ -5,7 +5,7 @@ The supervisor and its headless sibling use the same process identity contract
 on Linux and macOS. Windows remains refused by the shell wrapper because it
 does not provide the POSIX PTY and advisory-lock primitives used here.
 """
-import argparse, codecs, errno, fcntl, hashlib, json, os, pty, re, select, shlex, signal, struct, subprocess, sys, termios, time, tty, unicodedata, uuid
+import argparse, codecs, ctypes, errno, fcntl, hashlib, json, os, pty, re, select, shlex, signal, struct, subprocess, sys, termios, time, tty, unicodedata, uuid
 from pathlib import Path
 
 HERE=Path(__file__).resolve().parent
@@ -55,6 +55,25 @@ def proc_start(pid):
     reservation rather than being mistaken for a stale process.
     """
     if sys.platform == 'darwin':
+        try:
+            libproc=ctypes.CDLL('/usr/lib/libproc.dylib',use_errno=True)
+            libproc.proc_pidinfo.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_uint64,ctypes.c_void_p,ctypes.c_int]
+            libproc.proc_pidinfo.restype=ctypes.c_int
+            buf=ctypes.create_string_buffer(136)
+            ctypes.set_errno(0)
+            size=libproc.proc_pidinfo(int(pid),3,0,buf,136)
+            err=ctypes.get_errno()
+            if size==0 and err==errno.ESRCH or (size<0 and err==errno.ESRCH):
+                raise FileNotFoundError(errno.ENOENT,f'pid {pid} is not running')
+            if size==136:
+                sec=struct.unpack_from('<Q',buf.raw,120)[0]
+                usec=struct.unpack_from('<Q',buf.raw,128)[0]
+                if sec and usec<1_000_000:
+                    return f'darwin:{sec}:{usec:06d}'
+        except FileNotFoundError:
+            raise
+        except Exception:
+            pass
         try:
             result=subprocess.run([sys.executable,str(ROOT/'scripts/drivers/types/antigravity/mac-process-info.py'),str(pid)],capture_output=True,text=True)
         except OSError as exc:
@@ -350,6 +369,17 @@ class TerminalScreen:
 
 class Supervisor:
     HUMAN_IDLE_STABLE_SECONDS=0.6
+    _TERMINAL_RESPONSE_RE=re.compile(
+        rb'^(?:'
+        rb'\x1b\[\?[0-9;]*\$y'
+        rb'|\x1b\[\?[0-9;]*[cu]'
+        rb'|\x1b\[>[0-9;]*c'
+        rb'|\x1b\[[0-9]+;[0-9]+R'
+        rb'|\x1b\[[IO]'
+        rb'|\x1b\](?:10|11|12|7501);[^\x07\x1b]*(?:\x07|\x1b\\)'
+        rb'|\x1bP[01]\+r[^\x1b]*\x1b\\'
+        rb')+$'
+    )
     def __init__(self, args):
         self.a=args; self.project=str(Path(args.project).absolute()); self.owner=f'{uuid.uuid4()}.{os.getpid()}'
         self.start=proc_start(os.getpid()); self.cap=uuid.uuid4().hex+uuid.uuid4().hex
@@ -363,6 +393,9 @@ class Supervisor:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGUSR1, self.request_resume)
         signal.signal(signal.SIGWINCH, self.request_resize)
+    @classmethod
+    def is_terminal_response(cls, data):
+        return bool(data) and bool(cls._TERMINAL_RESPONSE_RE.match(data))
     def request_stop(self, signum, _frame):
         self.stop_reason=f'external stop request ({signal.Signals(signum).name})'
     def request_resume(self, _signum, _frame):
@@ -371,9 +404,11 @@ class Supervisor:
         self.resize_requested=True
     def pause_for_human_input(self):
         already_paused=self.state.get('humanInputActive',False)
-        self.state['humanInputActive']=True; self.state['humanInputSawNonIdle']=False; self.human_idle_since=None; self.save()
+        self.human_idle_since=None
         if not already_paused:
-            print('\r\n[agmsg] Automatic delivery is paused while a person is entering input. It will resume when the empty input prompt returns',file=sys.stderr)
+            self.state['humanInputActive']=True; self.state['humanInputSawNonIdle']=False; self.save()
+            if getattr(self,'master',None) is None:
+                print('\r\n[agmsg] Automatic delivery is paused while a person is entering input. It will resume when the empty input prompt returns',file=sys.stderr)
     def permission_input_rejection_reason(self):
         """Return None for the permission UI, otherwise a fail-closed diagnostic reason."""
         screen=getattr(self,'screen',None)
@@ -437,7 +472,8 @@ class Supervisor:
     def allow_permission_input(self):
         # The current batch waits for its receipt; preserve durable pause and set only a temporary input pause.
         self.state['humanInputActive']=True; self.state['humanInputSawNonIdle']=True; self.human_idle_since=None; self.save()
-        print('\r\n[agmsg] Relayed human input to the permission UI. It will resume after confirmation when the empty input prompt returns',file=sys.stderr)
+        if getattr(self,'master',None) is None:
+            print('\r\n[agmsg] Relayed human input to the permission UI. It will resume after confirmation when the empty input prompt returns',file=sys.stderr)
     @staticmethod
     def read_winsize(fd):
         return fcntl.ioctl(fd, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
@@ -626,17 +662,20 @@ class Supervisor:
         self.state['batch']=None; self.state['supervisorPhase']='WAITING_FOR_IDLE'
         if pause_after_ack:
             self.human_input_seen=True; self.state['manualResumeRequired']=True
-            print('\r\n[agmsg] Stopped subsequent automatic delivery because the message body contained an idle-screen signature. Resume: $agmsg resume',file=sys.stderr)
+            if getattr(self,'master',None) is None:
+                print('\r\n[agmsg] Stopped subsequent automatic delivery because the message body contained an idle-screen signature. Resume: $agmsg resume',file=sys.stderr)
         self.save()
     def maybe_poll(self):
-        if time.monotonic()-self.last_poll<self.a.poll: return
+        now=time.monotonic()
+        if now-self.last_poll<self.a.poll: return
+        self.last_poll=now
         self.check_guard()
         if (not self.injection_ready() or self.state.get('humanInputActive') or
                 self.state.get('manualResumeRequired') or self.state.get('durableAttention')): return
         if self.state['batch']:
             if self.state['batch'].get('phase')=='prepared': self.inject()
             return
-        self.last_poll=time.monotonic(); rows=self.call('peek').strip()
+        rows=self.call('peek').strip()
         if not rows:return
         msgs=[json.loads(x) for x in rows.splitlines()]; chosen=[]; size=0
         for m in msgs:
@@ -651,13 +690,22 @@ class Supervisor:
     def input_ready(self):
         # A footer alone cannot distinguish a permission screen from an in-progress input; require an empty input field too.
         screen=getattr(self,'screen',None)
-        if not screen or screen.uncertain or screen.state!='normal' or screen.decoder.getstate()[0]: return False
+        if not screen or screen.state!='normal' or screen.decoder.getstate()[0]: return False
+        if screen.uncertain:
+            state=getattr(self,'state',None) or {}
+            if state.get('supervisorPhase') in ('WAITING_FOR_IDLE','STARTING') and not state.get('batch'):
+                screen.uncertain=False; screen.uncertain_reason=None
+            else:
+                return False
         last_output=getattr(self,'last_output',0)
         if last_output>0 and time.monotonic()-last_output<0.3: return False
         footer=screen.tail_with_prefix(('? for shortcuts', '╭─', '╭'))
         if footer is None:return False
         footer_text=''.join(line.strip() for line in screen.lines()[footer[0]:footer[1]+1])
-        if ' ·' not in footer_text and 'READY' not in footer_text:return False
+        if footer_text.startswith('? for shortcuts'):
+            if ' ·' not in footer_text:return False
+        elif 'READY' not in footer_text:
+            return False
         # Inspect only the bottom footer and the input area above it, not the whole body.
         # On narrow terminals the footer's right-hand status wraps physically.
         before=[line.strip() for line in screen.lines()[:footer[0]] if line.strip()]
@@ -690,7 +738,8 @@ class Supervisor:
         if now-self.human_idle_since<self.HUMAN_IDLE_STABLE_SECONDS:return
         self.state['humanInputActive']=False; self.state['humanInputSawNonIdle']=False
         self.human_input_restart_recovery=False; self.human_idle_since=None; self.save()
-        print('\r\n[agmsg] Resumed automatic delivery after confirming the empty input prompt',file=sys.stderr)
+        if getattr(self,'master',None) is None:
+            print('\r\n[agmsg] Resumed automatic delivery after confirming the empty input prompt',file=sys.stderr)
     def loop(self):
         while not self.stopping:
             if self.resize_requested:
@@ -699,7 +748,8 @@ class Supervisor:
                 self.resume_requested=False
                 if self.state.get('supervisorPhase')=='WAITING_FOR_RESULT': self.fail('refused resume request during a delivery turn'); continue
                 self.state['manualResumeRequired']=False; self.state['humanInputActive']=False; self.state['humanInputSawNonIdle']=False; self.state['durableAttention']=False; self.human_input_restart_recovery=False; self.human_idle_since=None; self.state['supervisorPhase']='WAITING_FOR_IDLE'; self.save()
-                print('\r\nAccepted monitor resume request. Delivery will continue after the empty input prompt is confirmed',file=sys.stderr)
+                if getattr(self,'master',None) is None:
+                    print('\r\nAccepted monitor resume request. Delivery will continue after the empty input prompt is confirmed',file=sys.stderr)
             if self.stop_reason:
                 if self.state.get('batch') and self.state['batch'].get('phase')!='completed': self.fail(self.stop_reason)
                 break
@@ -728,13 +778,16 @@ class Supervisor:
             if sys.stdin.fileno() in r:
                 data=os.read(sys.stdin.fileno(),4096)
                 if not data: self.stopping=True; break
-                if (self.state.get('supervisorPhase')=='WAITING_FOR_RESULT'
-                        and (permission_before_read or self.permission_input_ready())): self.allow_permission_input()
-                elif self.state.get('supervisorPhase')=='WAITING_FOR_RESULT':
-                    reason=self.permission_input_rejection_reason()
-                    diagnostic=self.permission_screen_diagnostic()
-                    self.fail(f'detected human input during a delivery turn (permission rejection reason=before:{permission_before_reason}, after:{reason}; screen={diagnostic})')
-                else: self.pause_for_human_input()
+                if not self.is_terminal_response(data):
+                    if (self.state.get('supervisorPhase')=='WAITING_FOR_RESULT'
+                            and (permission_before_read or self.permission_input_ready())): self.allow_permission_input()
+                    elif self.state.get('supervisorPhase')=='WAITING_FOR_RESULT':
+                        reason=self.permission_input_rejection_reason()
+                        diagnostic=self.permission_screen_diagnostic()
+                        self.fail(f'detected human input during a delivery turn (permission rejection reason=before:{permission_before_reason}, after:{reason}; screen={diagnostic})')
+                    else:
+                        self.pause_for_human_input()
+                        self.last_output=time.monotonic()
                 os.write(self.master,data)
             self.update_human_input_state()
             self.maybe_poll()

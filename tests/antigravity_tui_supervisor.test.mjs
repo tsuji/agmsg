@@ -289,16 +289,52 @@ spec.loader.exec_module(module)
 s = module.Supervisor.__new__(module.Supervisor)
 s.state = {'manualResumeRequired': False, 'humanInputActive': False, 'humanInputSawNonIdle': False, 'supervisorPhase': 'WAITING_FOR_IDLE'}
 s.human_idle_since = None
-s.save = lambda: None
+saves = []
+s.save = lambda: saves.append(dict(s.state))
 notice = io.StringIO()
 with contextlib.redirect_stderr(notice):
     s.pause_for_human_input()
+    s.state['humanInputSawNonIdle'] = True
     s.pause_for_human_input()
 assert s.state['manualResumeRequired'] is False
 assert s.state['humanInputActive'] is True
-assert s.state['humanInputSawNonIdle'] is False
+assert s.state['humanInputSawNonIdle'] is True, 'subsequent keystrokes while paused must not reset humanInputSawNonIdle or re-save'
+assert len(saves) == 1, 'pause_for_human_input must only save on transition to paused'
 assert s.state['supervisorPhase'] == 'WAITING_FOR_IDLE'
 assert notice.getvalue().count('resume when the empty input prompt returns') == 1
+s.master = 99
+with contextlib.redirect_stderr(notice):
+    s.state['humanInputActive'] = False
+    s.pause_for_human_input()
+assert notice.getvalue().count('resume when the empty input prompt returns') == 1, 'must not write to stderr while child PTY is active'
+
+assert module.Supervisor.is_terminal_response(b'\\x1b[?2026;2$y\\x1b[?2027;2$y\\x1b]11;rgb:1c1c/1c1c/1c1c\\x07\\x1b[?1u')
+assert module.Supervisor.is_terminal_response(b'\\x1b[24;1R')
+assert not module.Supervisor.is_terminal_response(b'a')
+assert not module.Supervisor.is_terminal_response(b'\\x1b[A')
+
+s2 = module.Supervisor.__new__(module.Supervisor)
+s2.a = type('Args', (), {'poll': 2.0})()
+s2.last_poll = 0
+s2.state = {'humanInputActive': True, 'manualResumeRequired': False, 'durableAttention': False, 'batch': None}
+guards = []
+s2.check_guard = lambda: guards.append(1)
+s2.injection_ready = lambda: False
+s2.maybe_poll()
+s2.maybe_poll()
+assert len(guards) == 1, 'maybe_poll must update last_poll before early return so check_guard does not run on every keystroke'
+
+s3 = module.Supervisor.__new__(module.Supervisor)
+s3.screen = module.TerminalScreen(24, 120)
+s3.last_output = 0
+s3.state = {'supervisorPhase': 'WAITING_FOR_IDLE', 'batch': None}
+s3.screen.feed('>\\r\\n────────────────────────────────────────\\r\\n╭─ ⚙ WORKING ╱ ? help\\r\\n╰─ctx 0.0% · quota 30.92%'.encode())
+assert not s3.input_ready(), 'agy 1.4.3 WORKING footer must not be judged idle despite · in line 2'
+s3.screen = module.TerminalScreen(24, 120)
+s3.screen.feed(b'\\x1b[999z')
+assert s3.screen.uncertain
+s3.screen.feed('>\\r\\n────────────────────────────────────────\\r\\n╭─ ● READY ╱ ? help\\r\\n╰─ctx 0.0% · quota 30.92%'.encode())
+assert s3.input_ready(), 'agy 1.4.3 READY footer is idle and clears non-receipt uncertain state'
 `);
 });
 
