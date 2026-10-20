@@ -602,7 +602,7 @@ class Supervisor:
     @staticmethod
     def batch_contains_idle_signature(batch):
         """Pause later automatic injection until explicit resume when the body imitates an idle screen."""
-        return any(re.search(r'(?m)^>\s*$\n\? for shortcuts\b', m.get('body','')) for m in batch.get('messages',[]))
+        return any(re.search(r'(?m)^>\s*$\n(?:\? for shortcuts\b|╭─)', m.get('body','')) for m in batch.get('messages',[]))
     def inject(self):
         b=self.state['batch']; data=self.envelope(b).encode()
         os.write(self.master,b'\x1b[200~'+data+b'\x1b[201~\r')
@@ -654,10 +654,10 @@ class Supervisor:
         if not screen or screen.uncertain or screen.state!='normal' or screen.decoder.getstate()[0]: return False
         last_output=getattr(self,'last_output',0)
         if last_output>0 and time.monotonic()-last_output<0.3: return False
-        footer=screen.tail_with_prefix('? for shortcuts')
+        footer=screen.tail_with_prefix(('? for shortcuts', '╭─', '╭'))
         if footer is None:return False
         footer_text=''.join(line.strip() for line in screen.lines()[footer[0]:footer[1]+1])
-        if ' ·' not in footer_text:return False
+        if ' ·' not in footer_text and 'READY' not in footer_text:return False
         # Inspect only the bottom footer and the input area above it, not the whole body.
         # On narrow terminals the footer's right-hand status wraps physically.
         before=[line.strip() for line in screen.lines()[:footer[0]] if line.strip()]
