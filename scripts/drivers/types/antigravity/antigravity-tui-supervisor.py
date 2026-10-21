@@ -185,7 +185,7 @@ class TerminalScreen:
     """Fail-closed VT screen model limited to the range needed for receipt checks."""
     def __init__(self, rows, cols):
         self.rows=max(1,rows); self.cols=max(1,cols); self.cells=[[' ']*self.cols for _ in range(self.rows)]
-        self.row=0; self.col=0; self.saved=(0,0); self.state='normal'; self.sequence=''; self.decoder=codecs.getincrementaldecoder('utf-8')('replace'); self.uncertain=False; self.uncertain_reason=None; self.alternate_screen=False
+        self.row=0; self.col=0; self.saved=(0,0); self.state='normal'; self.sequence=''; self.decoder=codecs.getincrementaldecoder('utf-8')('replace'); self.uncertain=False; self.uncertain_reason=None; self.alternate_screen=False; self.last_char=None
     def mark_uncertain(self, reason):
         self.uncertain=True
         if self.uncertain_reason is None:self.uncertain_reason=reason
@@ -237,6 +237,7 @@ class TerminalScreen:
         if width==2:self._detach_cell(self.row,self.col+1)
         self.cells[self.row][self.col]=ch
         if width==2 and self.col+1<self.cols:self.cells[self.row][self.col+1]=''
+        self.last_char=ch
         self.col+=width
         if self.col>=self.cols:self.col=self.cols
     @staticmethod
@@ -257,6 +258,10 @@ class TerminalScreen:
             # CBT (Cursor Backward Tabulation) appears in agy 1.1.27 Read output.
             # Handle only the default eight-column tab stops initialized by DECST8C.
             for _ in range(n): self.col=max(0,((max(1,self.col)-1)//8)*8)
+        elif final=='b' and not body.startswith(('?','>','=')):
+            # REP (Repeat Preceding Character) appears in agy 1.4.3 TUI renderings.
+            if self.last_char:
+                for _ in range(n): self._write(self.last_char)
         elif final in ('H','f'):
             self.row=min(self.rows-1,max(0,(p[0] or 1)-1)); self.col=min(self.cols-1,max(0,(p[1] if len(p)>1 else 1)-1))
         elif final=='d': self.row=min(self.rows-1,max(0,n-1))

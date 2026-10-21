@@ -227,6 +227,11 @@ assert screen.lines()[0].startswith('12345678X012')
 assert not screen.uncertain, 'a CBT that follows a Read must not stop receipt judgment'
 screen.feed(b'\\x1b[?4W')
 assert screen.uncertain, 'an unobserved tab control is not tolerated'
+
+screen2 = module.TerminalScreen(4, 40)
+screen2.feed(b'a\\x1b[7b')
+assert not screen2.uncertain, 'REP (CSI 7b) repeats the preceding character without marking uncertain'
+assert screen2.lines()[0].startswith('aaaaaaaa')
 `);
 });
 
