@@ -140,6 +140,54 @@ while IFS= read -r team; do
   agmsg_role_session_record "$team" "$NAME" "$BARE_SID" "$PROJECT_PHYS" "$TYPE" "$SESSION_ID" || true
 done <<< "$TEAMS"
 
+# Once the seat is decided, move this Claude Code session onto agmsgd's direct
+# delivery when the daemon is ready and the session has a usable messaging
+# socket, so a seat chosen by actas does not depend on how many seats the
+# project registers. Prints "delivery=native" after the status line; the actas
+# procedure then skips the Monitor. Anything short of a verified record leaves
+# the Monitor path as it was.
+NATIVE_DELIVERY=0
+NATIVE_MONITOR_REASON=""
+if [ "$TYPE" = claude-code ] && [ -n "${SKILL_DIR:-}" ] \
+   && _native_target="$(agmsg_claude_code_native_target 2>/dev/null)" \
+   && [ -r "$SKILL_DIR/scripts/lib/daemon-state.sh" ]; then
+  # shellcheck source=scripts/lib/daemon-state.sh
+  . "$SKILL_DIR/scripts/lib/daemon-state.sh"
+  command -v _agmsg_detect_platform >/dev/null 2>&1 || . "$SKILL_DIR/scripts/lib/compat.sh"
+  _agmsg_detect_platform
+  agmsg_daemon_read_state
+  # A project that chose something other than agmsgd keeps the Monitor path.
+  agmsg_daemon_apply_project_choice claude-code "$PROJECT_PHYS"
+  # A restart may still be publishing readiness. Recheck once, never wait
+  # indefinitely and never override an explicit project opt-out.
+  if [ "${AGMSGD_DESIRED:-}" = on ] && [ "${AGMSGD_HEALTH:-}" != ready ]; then
+    sleep 0.2
+    agmsg_daemon_read_state
+    agmsg_daemon_apply_project_choice claude-code "$PROJECT_PHYS"
+  fi
+  if [ "${AGMSGD_HEALTH:-}" != ready ]; then
+    _native_health="${AGMSGD_HEALTH:-unknown}"
+    case "$_native_health" in *[!a-z_]*|'') _native_health=unknown ;; esac
+    NATIVE_MONITOR_REASON="agmsgd_not_ready_$_native_health"
+  elif ! agmsg_claude_code_native_storage_ready; then
+    NATIVE_MONITOR_REASON=native_storage_not_ready
+  fi
+  if [ -n "$NATIVE_MONITOR_REASON" ]; then
+    while IFS= read -r team; do
+      [ -z "$team" ] && continue
+      agmsg_role_session_mark_messaging_blocked "$team" "$NAME" "$NATIVE_MONITOR_REASON" "$BARE_SID" || true
+    done <<< "$TEAMS"
+  else
+    NATIVE_DELIVERY=1
+    while IFS= read -r team; do
+      [ -z "$team" ] && continue
+      agmsg_role_session_publish_messaging "$team" "$NAME" "${_native_target%%$'\t'*}" "${_native_target#*$'\t'}" "$BARE_SID" "${CLAUDE_CODE_MESSAGING_TOKEN:-}" || NATIVE_DELIVERY=0
+      # This Claude Code holds agmsgd's nudges: keep the Monitor path.
+      ! agmsg_daemon_claude_seat_held "$team" "$NAME" "${_native_target%%$'\t'*}" || NATIVE_DELIVERY=0
+    done <<< "$TEAMS"
+  fi
+fi
+
 # A monitored Codex seat's dispatcher reads its role pair from the seat request
 # rather than inferring it from the project roster. Actas can change the role
 # after SessionStart, so publish the new pair (or an empty pair when the claim
@@ -261,4 +309,9 @@ while IFS= read -r team; do
   printf ' team=%s' "$team"
 done <<< "$TEAMS"
 printf '\n'
+if [ "$NATIVE_DELIVERY" -eq 1 ]; then
+  echo "delivery=native"
+elif [ -n "$NATIVE_MONITOR_REASON" ]; then
+  printf 'delivery=monitor reason=%s\n' "$NATIVE_MONITOR_REASON"
+fi
 exit 0

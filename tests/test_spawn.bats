@@ -38,6 +38,13 @@ EOF
 }
 
 teardown() {
+  # The fake `codex app-server` (bash, with the python it waits on) is not in
+  # any pidfile a failed test is sure to have written, and teardown_test_env
+  # only reaps once its plain rm fails -- which it does not on macOS/Linux. So
+  # reap everything whose argv names this test's TEST_SKILL_DIR here, always.
+  # It reads argv the way the Git Bash path needs (/proc), is scoped to this
+  # test's own temp dir, and the python child exits once its parent is gone.
+  _reap_test_skill_dir_procs || true
   teardown_test_env
 }
 
@@ -1221,10 +1228,22 @@ case "$1/$2" in
     echo '{"id":"cli:tab:close","result":{"type":"ok"}}'
     ;;
   agent/rename)
+    if [ "$(grep -c '^agent rename ' "$HERDR_CALL_LOG")" -le "${HERDR_AGENT_RENAME_FAILURES:-0}" ]; then
+      echo '{"error":{"code":"agent_not_found"}}' >&2
+      exit 1
+    fi
     # `agent rename <pane_id> <key>` — record the mapping so `agent list` can
     # replay it. $3=pane id, $4=key.
     printf '%s\t%s\n' "$3" "$4" >> "$HERDR_AGENT_DB"
     echo '{"id":"cli:agent:rename","result":{"type":"ok"}}'
+    ;;
+  agent/get)
+    if [ "$(grep -c '^agent get ' "$HERDR_CALL_LOG")" -le "${HERDR_AGENT_GET_FAILURES:-0}" ]; then
+      echo '{"error":{"code":"agent_not_found"}}' >&2
+      exit 1
+    fi
+    _key="$(awk -F'\t' -v id="$3" '$1==id{k=$2} END{print k}' "$HERDR_AGENT_DB")"
+    printf '{"result":{"agent":{"pane_id":"%s","name":"%s"}}}\n' "$3" "$_key"
     ;;
   agent/list)
     # Replay the recorded (pane_id -> name) pairs as the agents array.
@@ -1246,7 +1265,7 @@ case "$1/$2" in
     # person would), "pane" when none was. $3=pane id.
     _label="$(awk -F'\t' -v id="$3" '$1==id{l=$2} END{print (l==""?"pane":l)}' "$HERDR_LABEL_DB" 2>/dev/null)"
     [ -n "$_label" ] || _label=pane
-    printf '{"result":{"pane":{"pane_id":"%s","label":"%s","agent_status":"idle","terminal_title":"t"}}}\n' "$3" "$_label"
+    printf '{"result":{"pane":{"pane_id":"%s","label":"%s","agent_status":"idle","terminal_title":"t","terminal_id":"term_spawn"}}}\n' "$3" "$_label"
     ;;
   *)
     echo '{"error":"unknown stub call: '"$*"'}' >&2
@@ -1507,11 +1526,13 @@ _spawn_recorded_id() {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   _setup_fake_herdr
   export HERDR_PROCESS_INFO_RC=1                  # arm 3 (before-typing unknown)
+  export HERDR_AGENT_GET_FAILURES=2               # detector has not recognized the CLI yet
   run env -u TMUX bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ"
   [ "$status" -eq 0 ]
   grep -q "BEFORE the boot was typed" <<<"$output"          # arm 3, before typing
   grep -q "status=launched-unconfirmed" <<<"$output"         # requirement 2, after typing
   grep -q "no-readiness-handshake" <<<"$output"
+  [ "$(grep -c '^agent get ' "$HERDR_CALL_LOG")" -eq 3 ]
 }
 
 # --- --terminal-driver / AGMSG_TERMINAL_DRIVER override ---
@@ -1734,7 +1755,38 @@ _boot_line_executable() {
   [ "$status" -eq 0 ]
   boot="$(cat "$CAPTURE")"
   run env SHELL="$STUB_BIN/noshell" bash "$boot"
+  # Forced failure for the teardown test below: stop here, with the fake
+  # app-server still up, the way a failing assertion would. The variable names
+  # a file that receives this test's own temp dir.
+  if [ -n "${AGMSG_TEST_SPAWN_FAIL_AFTER_LAUNCH:-}" ]; then
+    printf '%s' "$TEST_SKILL_DIR" > "$AGMSG_TEST_SPAWN_FAIL_AFTER_LAUNCH"
+    # The same listing and command-line source the reaper uses (no ps -o, which
+    # Git Bash lacks).
+    local _p
+    for _p in $(_pids_referencing_dir "$TEST_SKILL_DIR"); do
+      ( source "$SCRIPTS/lib/compat.sh"; compat_get_cmdline "$_p"; echo )
+    done > "$AGMSG_TEST_SPAWN_FAIL_AFTER_LAUNCH.procs"
+    false
+  fi
   _assert_bridged_argv
+}
+
+@test "spawn: a test that fails after the launch leaves no fake app-server behind (teardown reap)" {
+  # Runs the launch test above for real, forced to fail right after the fake
+  # app-server is up. What the inner run's teardown does -- or does not do -- is
+  # then read off the process list, by the temp dir the inner test reported.
+  local marker="$TEST_SKILL_DIR/inner-dir" inner
+  run env AGMSG_TEST_SPAWN_FAIL_AFTER_LAUNCH="$marker" \
+    bats -f "reaches the real binary WITH --remote \\(argv" "$BATS_TEST_DIRNAME/test_spawn.bats"
+  grep -q '^not ok 1 ' <<<"$output"
+  inner="$(cat "$marker")"
+  [ -n "$inner" ]
+  # Both halves of the fake were up and named by the temp dir: the bash codex
+  # and the python holding the listening socket. So "nothing references it
+  # now" covers the python and its socket, not just the bash.
+  grep -q 'codex app-server' "$marker.procs"
+  grep -qi 'python.* - ' "$marker.procs"
+  [ -z "$(_pids_referencing_dir "$inner")" ]
 }
 
 @test "spawn: a codex seat spawned FROM a bridged codex seat still reaches the real binary WITH --remote" {
@@ -1794,7 +1846,10 @@ _install_fake_codex_bridge_stack() {
 case "${1:-}" in
   --version) echo "codex-cli 0.142.2"; exit 0 ;;
   app-server)
-    python3 - <<'PY'
+    # The test's own dir rides in argv (the script path), so the shared reaper
+    # finds this python directly; a native Windows python keeps reporting the
+    # same getppid() after its parent dies, so it cannot be left to notice.
+    python3 - "$0" <<'PY'
 import socket, sys, os
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1829,7 +1884,7 @@ FAKE
 }
 
 # The evidence both end-to-end tests read: the real binary was reached exactly
-# once, bridged, with the actas prompt. Then the fake app-server is put down.
+# once, bridged, with the actas prompt. The fake app-server is put down by teardown.
 _assert_bridged_argv() {
   [ -f "$CALL_LOG" ]
   # The real binary was reached exactly once, with the bridge flag and the actas prompt.
@@ -1837,13 +1892,6 @@ _assert_bridged_argv() {
   grep -q '^real-codex <--remote> <ws://127\.0\.0\.1:[0-9][0-9]*>' "$CALL_LOG"
   grep -q 'actas' "$CALL_LOG"
   grep -q 'reviewer' "$CALL_LOG"
-  # Clean up the fake app-server the shim brought up.
-  local pf pid
-  for pf in "$TEST_SKILL_DIR"/run/codex-app-server.*.pid; do
-    [ -f "$pf" ] || continue
-    pid="$(cat "$pf" 2>/dev/null)"; [ -n "$pid" ] || continue
-    kill "$pid" 2>/dev/null || true
-  done
 }
 
 @test "spawn: an inherited PATH-wrapper install (AGMSG_CODEX_SHIM_WRAPPER/SCRIPT_DIR) cannot repoint the bundled shim" {
@@ -2048,10 +2096,8 @@ OPS
 }
 
 @test "spawn-side naming: herdr retries agent_not_found until detection then confirms the key (#1100)" {
-  _install_fake_naming_herdr
+  _setup_fake_herdr
   bash "$SCRIPTS/join.sh" cxteam existing codex "$PROJ"
-  export FAKE_NAME_LOG="$TEST_SKILL_DIR/name.log"
-  : > "$FAKE_NAME_LOG"
   cat > "$STUB_BIN/sleep" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_SLEEP_LOG"
@@ -2060,20 +2106,20 @@ EOF
   export FAKE_SLEEP_LOG="$TEST_SKILL_DIR/sleep.log"
   : > "$FAKE_SLEEP_LOG"
 
-  run env FAKE_NAME_LOG="$FAKE_NAME_LOG" FAKE_NAME_FAILS=2 \
+  run env HERDR_AGENT_GET_FAILURES=2 \
     FAKE_SLEEP_LOG="$FAKE_SLEEP_LOG" \
     bash "$SCRIPTS/spawn.sh" codex bob --project "$PROJ" --terminal-driver herdr --no-wait
   [ "$status" -eq 0 ]
-  [ "$(wc -l < "$FAKE_NAME_LOG" | tr -d ' ')" -eq 3 ]
+  [ "$(grep -c '^agent get ' "$HERDR_CALL_LOG")" -eq 3 ]
+  [ "$(grep -c '^agent rename ' "$HERDR_CALL_LOG")" -eq 1 ]
   [ "$(wc -l < "$FAKE_SLEEP_LOG" | tr -d ' ')" -eq 2 ]
+  [ "$(grep -c '^0.1$' "$FAKE_SLEEP_LOG")" -eq 2 ]
   refute grep -qF "status=spawned-but-unnamed" <<<"$output"
 }
 
 @test "spawn-side naming: herdr bounds a persistent agent_not_found and reports unnamed (#1100)" {
-  _install_fake_naming_herdr
+  _setup_fake_herdr
   bash "$SCRIPTS/join.sh" cxteam existing codex "$PROJ"
-  export FAKE_NAME_LOG="$TEST_SKILL_DIR/name.log"
-  : > "$FAKE_NAME_LOG"
   cat > "$STUB_BIN/sleep" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_SLEEP_LOG"
@@ -2082,12 +2128,16 @@ EOF
   export FAKE_SLEEP_LOG="$TEST_SKILL_DIR/sleep.log"
   : > "$FAKE_SLEEP_LOG"
 
-  run env FAKE_NAME_LOG="$FAKE_NAME_LOG" FAKE_NAME_FAILS=99 \
+  run env HERDR_AGENT_GET_FAILURES=3 HERDR_AGENT_RENAME_FAILURES=99 \
     FAKE_SLEEP_LOG="$FAKE_SLEEP_LOG" \
     bash "$SCRIPTS/spawn.sh" codex bob --project "$PROJ" --terminal-driver herdr --no-wait
   [ "$status" -eq 0 ]
-  [ "$(wc -l < "$FAKE_NAME_LOG" | tr -d ' ')" -eq 11 ]
-  [ "$(wc -l < "$FAKE_SLEEP_LOG" | tr -d ' ')" -eq 10 ]
+  # One driver budget across both phases, with no outer retry restarting it:
+  # three failed observations, then 48 failed renames, and 50 sleeps total.
+  [ "$(grep -c '^agent get ' "$HERDR_CALL_LOG")" -eq 51 ]
+  [ "$(grep -c '^agent rename ' "$HERDR_CALL_LOG")" -eq 48 ]
+  [ "$(wc -l < "$FAKE_SLEEP_LOG" | tr -d ' ')" -eq 50 ]
+  [ "$(grep -c '^0.1$' "$FAKE_SLEEP_LOG")" -eq 50 ]
   grep -qF "status=spawned-but-unnamed" <<<"$output"
 }
 
@@ -2274,17 +2324,13 @@ EOF
   refute grep -qF 'status=spawned-but-unnamed' <<<"$output"
 }
 
-@test "join: names its own pane at boot (control), and not under AGMSG_SELF_NAME=off (#1096)" {
-  # The control half needs naming ON by default (against the fake herdr
-  # below, never a real terminal) to mean anything against the off half
-  # right after it -- opt back in from the harness's #1095 off
-  # (test_helper.bash).
+@test "join: registration does not name the caller with naming enabled or disabled" {
+  # Exercise both switch values against a fake terminal.
   unset AGMSG_SELF_NAME
   _setup_fake_herdr
-  # Control: a seat joining from its own pane names it -- key and prefixed label.
+  # Registration alone does not establish whose identity the caller holds.
   bash "$SCRIPTS/join.sh" myteam bob claude-code "$PROJ"
-  grep -q '^agent rename wT:pSelf ' "$HERDR_CALL_LOG"
-  grep -q '^pane rename wT:pSelf myteam:bob$' "$HERDR_CALL_LOG"
+  refute grep -q ' rename ' "$HERDR_CALL_LOG"
   : > "$HERDR_CALL_LOG"
   # The switch spawn sets on its pre-join: the same join, no naming call at all.
   AGMSG_SELF_NAME=off bash "$SCRIPTS/join.sh" myteam carol claude-code "$PROJ"

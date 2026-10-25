@@ -1,6 +1,6 @@
 ---
 name: __SKILL_NAME__
-description: Cross-agent messaging via SQLite. Send messages between Claude Code, Codex, Gemini CLI, and other agents. No daemon, no network, no dependencies beyond bash and sqlite3.
+description: Cross-agent messaging via SQLite. Send messages between Claude Code, Codex, Gemini CLI, and other agents. No network, no dependencies beyond bash and sqlite3, and no daemon required (the optional agmsgd is a local resident service).
 ---
 
 <!-- agmsg:render-root -->
@@ -116,7 +116,7 @@ If argument is "config":
 1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/config.sh show`
 2. Show the output to the user.
 
-If argument starts with "config set" (e.g. "config set hook.check_interval 30"):
+If argument starts with "config set" (e.g. "config set delivery.turn.check_interval 30"):
 1. Parse key and value from the arguments.
 2. Run: `~/.agents/skills/__SKILL_NAME__/scripts/config.sh set <key> <value>`
 
@@ -125,8 +125,9 @@ If argument is "version":
 2. Show the output — the installed version (git-describe provenance recorded at install time).
 
 If asked to update or upgrade agmsg:
-1. Run: `npx agmsg@latest install --update` — add `--cmd <name>` when this machine has more than one agmsg install. It keeps the database and team configs and replaces the scripts.
-2. Tell the user to restart running agent sessions so they pick up the new scripts.
+1. Say "Downloading the agmsg update…" before running `npx agmsg@latest install --update` — add `--cmd <name>` when this machine has more than one agmsg install. It keeps the database and team configs and replaces the scripts.
+2. This session still has the old skill loaded. Re-read the updated installation's `SKILL.md`, read the new version's section of its `CHANGELOG.md`, and tell the user what changed and which settings it recommends. The update output gives the real file paths and version.
+3. Tell the user to restart running agent sessions so they pick up the new scripts.
 
 If argument is "where" (e.g. asked to report this session's own pane or placement):
 1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/where.sh`
@@ -153,7 +154,7 @@ If argument starts with "spawn" (e.g. "spawn claude-code alice", "spawn codex re
 1. Parse `<type>` (a spawnable agent type), `<name>`, and any options (`--boot-prompt <text>`, `--project <path>`, `--team <team>`, `--window`, `--split h|v`, `--terminal <template>`, `--no-wait`, `--ready-timeout <secs>`, `--model <id>`, `--fresh`).
 2. Run: `~/.agents/skills/__SKILL_NAME__/scripts/spawn.sh <type> <name> --project "$(pwd)" [options]`
    - `spawn.sh` pre-joins `<name>`, then opens a new pane or window through the terminal driver and launches the target CLI with `__CMD_PREFIX____SKILL_NAME__ actas <name>` as its initial prompt. `--boot-prompt` appends a first task to that prompt. Which terminal that is is the driver's decision, never something to name here.
-   - By default it waits for a target watcher to attach and report `status=ready`; `--no-wait` returns immediately. Codex has no Monitor, so a Codex spawn skips that readiness wait.
+   - By default it waits for a target watcher to attach and report `status=ready`; `--no-wait` returns immediately. Codex has no spawn-time readiness handshake, so a Codex spawn skips that readiness wait (this is separate from how it receives messages).
    - It refuses early when `<name>` is already held, the target CLI is missing, the project path is invalid, or the terminal driver has nowhere to place it.
 3. Show the script's output.
 
@@ -162,7 +163,7 @@ If argument starts with "despawn" (e.g. "despawn reviewer", "despawn alice --for
 2. Determine which team `<name>` belongs to, then run:
    `~/.agents/skills/__SKILL_NAME__/scripts/despawn.sh <team> $AGENT <name> [--force] [--timeout <secs>]`
    - The default graceful path sends a `ctrl:despawn` message so the member's watcher drops its role and closes its spawned pane, then waits for the lock to release.
-   - If the member has no watcher, or graceful teardown times out, use `--force` to tear down the recorded placement and drop the registration directly.
+   - If the member has no watcher (for example Codex), or graceful teardown times out, use `--force` to tear down the recorded placement and drop the registration directly.
 3. Show the script's output.
 <!-- /agmsg:slot spawn -->
 

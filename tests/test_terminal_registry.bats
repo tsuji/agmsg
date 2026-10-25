@@ -88,6 +88,12 @@ if [ "\$1" = agent ] && [ "\$2" = list ]; then
   printf '{"id":"1","result":{"type":"list","agents":[{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"%s"},"pane_id":"wC:p4","display_agent":"team:alice","name":"a-key"}]}}\n' "$sid"
 elif [ "\$1" = pane ] && [ "\$2" = split ]; then
   echo '{"result":{"pane":{"pane_id":"wC:p9"}}}'
+elif [ "\$1" = agent ] && [ "\$2" = get ]; then
+  if [ "\${HERDR_AGENT_GET_FAIL:-}" = 1 ]; then echo '{"error":{"code":"agent_not_found"}}' >&2; exit 1; fi
+  if [ -n "\${HERDR_AGENT_GET_JSON:-}" ]; then printf '%s\n' "\$HERDR_AGENT_GET_JSON"; exit 0; fi
+  printf '{"result":{"agent":{"pane_id":"%s","name":"%s"}}}\n' "\$3" "\${HERDR_AGENT_NAME:-}"
+elif [ "\$1" = pane ] && [ "\$2" = get ]; then
+  echo '{"result":{"pane":{"terminal_id":"term_naming"}}}'
 elif [ "\$1" = tab ] && [ "\$2" = create ]; then
   echo '{"result":{"root_pane":{"pane_id":"wD:p1"}}}'
 elif [ "\$1" = pane ] && [ "\$2" = read ]; then
@@ -217,7 +223,15 @@ _fake_herdr_list_two_sessions() {   # <sid1> <pane1> <sid2> <pane2>
   if [ -n "$sid2" ]; then
     entries="$entries$sep{\"agent\":\"b\",\"agent_session\":{\"agent\":\"b\",\"kind\":\"id\",\"source\":\"herdr:b\",\"value\":\"$sid2\"},\"pane_id\":\"$pane2\"}"
   fi
-  printf '#!/usr/bin/env bash\n[ "$1" = agent ] && [ "$2" = list ] && { echo '\''{"id":"1","result":{"type":"list","agents":[%s]}}'\''; exit 0; }\nexit 0\n' "$entries" > "$FAKEBIN/herdr"
+  cat > "$FAKEBIN/herdr" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = agent ] && [ "\$2" = list ]; then
+  printf '%s\n' '{"id":"1","result":{"type":"list","agents":[$entries]}}'
+elif [ "\$1" = agent ] && [ "\$2" = get ]; then
+  printf '{"result":{"agent":{"pane_id":"%s"}}}\n' "\$3"
+fi
+exit 0
+EOF
   chmod +x "$FAKEBIN/herdr"; export PATH="$FAKEBIN:$PATH"
 }
 
@@ -2767,20 +2781,9 @@ M
   grep -Fq "herdr:$HERDR_SOCKET_PATH:wC:p4" "$rec"
 }
 
-# --- join names a pane; it does not take the seat -----------------------------
-#
-# The 6th argument's default is "do not write the record", and join is the caller
-# that relies on it: the same identity can be joined from a second session while a
-# first one holds it through actas, and the record is what peek/poke resolve a
-# member's pane through. A second pane joining an already-held identity must not
-# take that placement over.
-#
-# Driven through join.sh, because the property is the CALLER's choice. The
-# helper's default is covered above — and that test stays green when join passes
-# `record`, which is measured: adding it to join.sh:260 leaves every test in this
-# file and in test_actas_integration green. A safe default proves nothing about
-# who takes it.
-@test "join: names the pane but does NOT take the seat's placement" {
+# --- Registration does not adopt a terminal identity ------------------------
+
+@test "join: tmux registration neither names the caller nor takes placement" {
   _install_fake_tmux
   export PATH="$FAKEBIN:$PATH"
   export TMUX="/tmp/fake,1,0" TMUX_PANE="%1"
@@ -2798,10 +2801,7 @@ M
   run bash "$SKILL_DIR/scripts/join.sh" seatteam alice claude-code /proj/A
   [ "$status" -eq 0 ]
 
-  # Positive control FIRST: join reached the naming step and the pane really was
-  # named. Without it a join that skipped naming altogether also leaves the record
-  # alone, and this test would read that as the property holding.
-  grep -q '\[select-pane\]' "$ARGV_LOG" || grep -q '\[set-option\]' "$ARGV_LOG"
+  refute grep -q '\[select-pane\]\|\[set-option\]' "$ARGV_LOG"
 
   # The seat's placement is not join's to take. `cmp`, not `[ "$(cat …)" = … ]`:
   # command substitution strips every trailing newline, so the string form is
@@ -2814,23 +2814,60 @@ M
   grep -q '/proj/OLD' "$rec"
 }
 
-@test "join: resolves a herdr pane from the type's dedicated session_env (#1024)" {
-  _install_fake_herdr "thread-right"
-  export PATH="$FAKEBIN:$PATH"
-  export HERDR_ENV=1 CODEX_SANDBOX=marker CODEX_THREAD_ID=thread-right
+@test "join: proxy registration leaves the caller untouched and actas records the member pane" {
+  export CODEX_HOME="$TEST_SKILL_DIR/codex-profile"
+  export AGMSG_CONFIG="$TEST_SKILL_DIR/config.json"
+  export AGMSG_APP_BASE="$TEST_SKILL_DIR/app"
   export AGMSG_STORAGE_PATH="$TEST_SKILL_DIR/db/messages.db"
-
-  run bash "$SKILL_DIR/scripts/join.sh" seatteam alice codex /proj/A
+  export HERDR_ENV=1 HERDR_PANE_ID=wA:p1
+  export LABEL_STATE="$TEST_SKILL_DIR/labels"
+  printf 'caller:original' > "$LABEL_STATE"
+  cat > "$FAKEBIN/herdr" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$ARGV_LOG"
+case "$1/$2" in
+  pane/list)
+    printf '{"result":{"panes":[{"pane_id":"wA:p1","label":"%s"}]}}\n' "$(cat "$LABEL_STATE")" ;;
+  pane/get)
+    label=member
+    [ "$3" != wA:p1 ] || label="$(cat "$LABEL_STATE")"
+    printf '{"result":{"pane":{"pane_id":"%s","label":"%s"}}}\n' "$3" "$label" ;;
+  pane/rename)
+    [ "$3" != wA:p1 ] || printf '%s' "$4" > "$LABEL_STATE" ;;
+  agent/list) printf '{"result":{"agents":[]}}\n' ;;
+  agent/get) printf '{"result":{"agent":{"pane_id":"%s"}}}\n' "$3" ;;
+  agent/rename) : ;;
+  *) exit 1 ;;
+esac
+STUB
+  chmod +x "$FAKEBIN/herdr"
+  export PATH="$FAKEBIN:$PATH"
+  local project="$TEST_SKILL_DIR/project"
+  mkdir -p "$project"
+  run bash "$SKILL_DIR/scripts/join.sh" seatteam alice claude-code "$project"
   [ "$status" -eq 0 ]
 
-  # Positive controls: join asked herdr and named the pane it found. The
-  # CODEX_SANDBOX marker is deliberately different; borrowing the first detect=
-  # key instead of session_env makes this test fail at the lookup.
-  grep -Fq 'herdr [agent] [list]' "$ARGV_LOG"
-  grep -Fq 'herdr [pane] [rename] [wC:p4] [seatteam:alice]' "$ARGV_LOG"
+  # Claim from the member's pane after registration by a different caller.
+  export HERDR_PANE_ID=wB:p2
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" "$project" claude-code alice member-session
+  [ "$status" -eq 0 ]
+  source "$SKILL_DIR/scripts/lib/role-session.sh"
+  local named
+  named="$(agmsg_role_session_named seatteam alice)"
+  [ "${named%%$'\t'*}" = "herdr:$HERDR_SOCKET_PATH:wB:p2" ]
+  [ "$(cat "$LABEL_STATE")" = caller:original ]
+  refute grep -Eq '^(pane|agent) rename wA:p1 ' "$ARGV_LOG"
+  grep -Fq 'pane rename wB:p2 seatteam:alice' "$ARGV_LOG"
+}
 
-  # Naming at join is still display-only. Supplying a session id must not turn
-  # join into a placement claim for an identity that another session may hold.
+@test "join: a dedicated session_env does not authorize pane naming" {
+  _install_fake_herdr "thread-right"
+  export HERDR_ENV=1 CODEX_SANDBOX=marker CODEX_THREAD_ID=thread-right
+  export CODEX_HOME="$TEST_SKILL_DIR/codex-profile"
+  export AGMSG_STORAGE_PATH="$TEST_SKILL_DIR/db/messages.db"
+  run bash "$SKILL_DIR/scripts/join.sh" seatteam alice codex /proj/A
+  [ "$status" -eq 0 ]
+  refute grep -q '\[rename\]' "$ARGV_LOG"
   source "$SKILL_DIR/scripts/lib/actas-lock.sh"
   local rec; rec="$(agmsg_spawn_path seatteam alice)"
   refute test -e "$rec"
@@ -2894,15 +2931,58 @@ M
   refute grep -Fq 'herdr [pane] [rename]' "$ARGV_LOG"
 }
 
-@test "naming ON by default (herdr): both renames (#1044)" {
+@test "naming ON by default (herdr): keeps existing names and records placement (#1631)" {
   _install_fake_herdr "sess-on"
+  agmsg_terminal_load herdr
+  source "$SKILL_DIR/scripts/lib/actas-lock.sh"
   export HERDR_ENV=1
   unset AGMSG_TERMINAL_NAMING
 
-  run agmsg_terminal_name_self "sess-on" onteam alice /proj/A claude-code
+  export HERDR_AGENT_NAME=reviewer
+  run agmsg_terminal_name_self "sess-on" onteam alice /proj/A claude-code record
   [ "$status" -eq 0 ]
   grep -Fq 'herdr [pane] [rename] [wC:p4] [onteam:alice]' "$ARGV_LOG"
+  refute grep -Fq 'herdr [agent] [rename]' "$ARGV_LOG"
+  local rec; rec="$(agmsg_spawn_path onteam alice)"
+  grep -Fq "herdr:$HERDR_SOCKET_PATH:wC:p4" "$rec"
+  [ "$(terminal_expected_label onteam alice "$HERDR_SOCKET_PATH:wC:p4")" = reviewer ]
+  : > "$ARGV_LOG"
+  AGMSG_TERMINAL_NAMING=off run agmsg_terminal_name_self "sess-on" onteam alice /proj/A claude-code record
+  [ "$status" -eq 0 ]
+  refute grep -Fq 'herdr [agent] [rename]' "$ARGV_LOG"
+  refute grep -Fq 'herdr [pane] [rename]' "$ARGV_LOG"
+
+  # A readable but unnamed agent still gets the internal key and placement.
+  : > "$ARGV_LOG"
+  unset HERDR_AGENT_NAME
+  run agmsg_terminal_name_self "sess-on" onteam alice /proj/A claude-code record
+  [ "$status" -eq 0 ]
   grep -Fq 'herdr [agent] [rename]' "$ARGV_LOG"
+  grep -Fq 'herdr [pane] [rename] [wC:p4] [onteam:alice]' "$ARGV_LOG"
+  grep -Fq "herdr:$HERDR_SOCKET_PATH:wC:p4" "$rec"
+  [ "$(terminal_expected_label onteam alice "$HERDR_SOCKET_PATH:wC:p4")" = "$(_herdr_internal_key onteam alice)" ]
+
+  # Unknown is not unnamed: malformed replies and replies about another pane
+  # cannot authorize either rename or turn a retained name into a hash.
+  local reply
+  local kept_record; kept_record="$(_herdr_name_record_path onteam alice)"
+  for reply in 'not json' '{}' '{"result":{"agent":{"pane_id":"w9:p9","name":"reviewer"}}}' \
+    '{"result":{"agent":{"pane_id":"wC:p4","name":"reviewer\n"}}}' \
+    '{"result":{"agent":{"pane_id":"wC:p4","name":"reviewer\u0000hidden"}}}'; do
+    : > "$ARGV_LOG"
+    printf 'existing decision\n' > "$kept_record"
+    HERDR_AGENT_GET_JSON="$reply" run agmsg_terminal_name_self "sess-on" onteam alice /proj/A claude-code record
+    [ "$status" -ne 0 ]
+    refute grep -Fq 'herdr [agent] [rename]' "$ARGV_LOG"
+    refute grep -Fq 'herdr [pane] [rename]' "$ARGV_LOG"
+    [ "$(cat "$kept_record")" = 'existing decision' ]
+  done
+  : > "$ARGV_LOG"
+  HERDR_AGENT_GET_FAIL=1 run agmsg_terminal_name_self "sess-on" onteam alice /proj/A claude-code record
+  [ "$status" -ne 0 ]
+  grep -Fq agent_not_found <<< "$output"
+  refute grep -Fq 'herdr [agent] [rename]' "$ARGV_LOG"
+  [ "$(cat "$kept_record")" = 'existing decision' ]
 }
 
 # --- a failed KEY is a failure, in the mode everybody uses (#1044) ------------
@@ -3006,6 +3086,126 @@ M
   # Nothing was renamed: no key could be built, so the member is not addressable
   # and saying `ok` would have claimed that it was.
   refute grep -Fq 'herdr [agent] [rename]' "$ARGV_LOG"
+}
+
+# A herdr whose `agent rename` answers `agent_not_found` (herdr's real shape,
+# measured live: `{"error":{"code":"agent_not_found","message":"agent target
+# <id> not found"}}` on stderr, exit 1) for the first N attempts, then
+# succeeds -- standing in for the pane whose running process just restarted
+# (measured: `codex resume` after the bridge was lost, #1631), where herdr's
+# own passive detection of the new process takes a few seconds and has not
+# caught up yet. Everything else matches _install_fake_herdr.
+_install_fake_herdr_rename_recovers_from_not_found() {
+  local sid="${1:-}" fail_times="${2:-1}" get_fail_times="${3:-0}"
+  printf '%s' "$fail_times" > "$TEST_SKILL_DIR/rename-not-found-remaining"
+  printf '%s' "$get_fail_times" > "$TEST_SKILL_DIR/get-not-found-remaining"
+  cat > "$FAKEBIN/herdr" <<EOF
+#!/usr/bin/env bash
+{ printf 'herdr'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
+counter="$TEST_SKILL_DIR/rename-not-found-remaining"
+get_counter="$TEST_SKILL_DIR/get-not-found-remaining"
+if [ "\$1" = agent ] && [ "\$2" = list ]; then
+  printf '{"id":"1","result":{"type":"list","agents":[{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"%s"},"pane_id":"wC:p4","display_agent":"team:alice","name":"a-key"}]}}\n' "$sid"
+elif [ "\$1" = agent ] && [ "\$2" = get ]; then
+  if [ "\${HERDR_QUERY_OTHER_ERROR:-}" = 1 ]; then
+    echo '{"error":{"code":"permission_denied"}}' >&2; exit 1
+  fi
+  remaining="\$(cat "\$get_counter")"
+  if [ "\$remaining" -gt 0 ]; then
+    echo "\$((remaining - 1))" > "\$get_counter"
+    echo '{"error":{"code":"agent_not_found"}}' >&2; exit 1
+  fi
+  kept="\${HERDR_AFTER_DETECTION_NAME:-}"
+  if [ -n "\${HERDR_AFTER_RENAME_NAME:-}" ] && [ "\$(cat "\$counter")" = 0 ]; then
+    kept="\$HERDR_AFTER_RENAME_NAME"
+  fi
+  printf '{"result":{"agent":{"pane_id":"%s","name":"%s"}}}\n' "\$3" "\$kept"
+elif [ "\$1" = pane ] && [ "\$2" = get ]; then
+  echo '{"result":{"pane":{"terminal_id":"term_retry"}}}'
+elif [ "\$1" = pane ] && [ "\$2" = rename ]; then
+  exit 0
+elif [ "\$1" = agent ] && [ "\$2" = rename ]; then
+  remaining="\$(cat "\$counter" 2>/dev/null || echo 0)"
+  if [ "\$remaining" -gt 0 ]; then
+    echo "\$((remaining - 1))" > "\$counter"
+    echo '{"error":{"code":"agent_not_found","message":"agent target wC:p9 not found"},"id":"cli:agent:rename"}' >&2
+    exit 1
+  fi
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "$FAKEBIN/herdr"
+  export PATH="$FAKEBIN:$PATH"
+  export HERDR_SOCKET_PATH="$TEST_SKILL_DIR/herdr.sock"
+}
+
+# --- a rename that fails only because herdr has not detected the agent YET
+# retries instead of failing the seat outright (#1631: `codex resume` after
+# the bridge was lost left the key unset, and re-running `/agmsg actas` right
+# after did not fix it -- herdr's own passive detection of the newly
+# (re)started process is not instant, and the single rename attempt this
+# driver made before this fix landed in exactly that few-second window).
+@test "terminal_name retries an 'agent_not_found' rename and succeeds once herdr catches up (#1631)" {
+  _install_fake_herdr_rename_recovers_from_not_found "sess-retry" 3
+  agmsg_terminal_load herdr
+
+  run terminal_name 'wC:p9' teamx alice
+  [ "$status" -eq 0 ]
+  [ "$output" = ok ]
+  # Three agent_not_found answers, then the one that actually renamed it.
+  [ "$(grep -c '\[agent\] \[rename\]' "$ARGV_LOG")" -eq 4 ]
+
+  # A real not-yet-detected agent makes get fail too, rather than returning
+  # empty successful output. Keep a name that appears when detection catches up.
+  : > "$ARGV_LOG"
+  _install_fake_herdr_rename_recovers_from_not_found sess-retry 0 3
+  HERDR_AFTER_DETECTION_NAME=reviewer run terminal_name wC:p9 teamx alice
+  [ "$status" -eq 0 ]
+  [ "$output" = ok ]
+  [ "$(grep -c '\[agent\] \[get\]' "$ARGV_LOG")" -eq 4 ]
+  refute grep -q '\[agent\] \[rename\]' "$ARGV_LOG"
+  [ "$(terminal_expected_label teamx alice wC:p9)" = reviewer ]
+
+  # Re-observe after rename fails: a newly registered, externally named agent
+  # is not permission to retry the stale plan to overwrite its name.
+  : > "$ARGV_LOG"
+  _install_fake_herdr_rename_recovers_from_not_found sess-retry 1
+  HERDR_AFTER_RENAME_NAME=reviewer run terminal_name wC:p9 teamx alice
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '\[agent\] \[rename\]' "$ARGV_LOG")" -eq 1 ]
+  [ "$(grep -c '\[agent\] \[get\]' "$ARGV_LOG")" -eq 2 ]
+  [ "$(terminal_expected_label teamx alice wC:p9)" = reviewer ]
+
+  : > "$ARGV_LOG"
+  _install_fake_herdr_rename_recovers_from_not_found sess-retry 0 99
+  run terminal_name wC:p9 teamx alice
+  [ "$status" -eq 13 ]
+  [ "$(grep -c '\[agent\] \[get\]' "$ARGV_LOG")" -eq 51 ]
+  refute grep -q '\[agent\] \[rename\]' "$ARGV_LOG"
+
+  # Unrelated observation failures are refused immediately, not retried.
+  : > "$ARGV_LOG"
+  HERDR_QUERY_OTHER_ERROR=1 run terminal_name wC:p9 teamx alice
+  [ "$status" -eq 13 ]
+  [ "$(grep -c '\[agent\] \[get\]' "$ARGV_LOG")" -eq 1 ]
+  refute grep -q '\[agent\] \[rename\]' "$ARGV_LOG"
+}
+
+# The retry is bounded and specific to agent_not_found: a rename that never
+# recovers still fails (no infinite loop), and a DIFFERENT failure (no
+# agent_not_found body at all, same shape test_terminal_registry.bats's other
+# HERDR_AGENT_RENAME_RC=1 tests already use) is not retried at all -- which
+# this asserts directly, by call count, rather than only by the end result
+# those other tests already cover.
+@test "terminal_name does not retry a rename failure that is not 'agent_not_found' (#1631)" {
+  _install_fake_herdr "sess-k"
+  export HERDR_AGENT_RENAME_RC=1
+  agmsg_terminal_load herdr
+
+  run terminal_name 'wC:p9' teamx alice
+  [ "$status" -ne 0 ]
+  [ "$(grep -c '\[agent\] \[rename\]' "$ARGV_LOG")" -eq 1 ]
 }
 
 # --- a driver that is missing a required op does not load (#1051) -------------
@@ -3695,11 +3895,10 @@ _tmux_op_args() {
   refute test -e "$mine"
 }
 
-@test "placement guard: this seat's record under a VANISHED team blocks it (closed) and the message names the file to remove (#1114 review)" {
-  # The exact rule builds this agent's record path for each team on disk. A team
-  # dropped with its run/ record left behind has no path to build, so that
-  # record reads as a rival: fail-closed, and the refusal must say the way out
-  # is the file, since "drop or despawn" points at this seat itself.
+@test "placement guard: a record under a VANISHED team is dropped and the seat acting now is recorded, without a warning" {
+  # A team dropped with its run/ record left behind: the record is older than
+  # any seat now acting, so it is replaced rather than left to warn on every
+  # action. A claimant whose team still exists keeps the guard (control below).
   _install_fake_tmux
   export PATH="$FAKEBIN:$PATH"
   export TMUX="/tmp/fake,1,0" TMUX_PANE="%1"
@@ -3714,11 +3913,9 @@ _tmux_op_args() {
   : > "$ARGV_LOG"
   run agmsg_terminal_name_self "" seatteam alice /proj/MINE claude-code record
   [ "$status" -eq 0 ]
-  grep -q 'did not name or record' <<<"$output"
-  grep -q "recorded as gone__alice's" <<<"$output"
-  grep -q 'remove run/spawn.gone__alice' <<<"$output"
-  refute grep -qE '\[set-option\]|\[select-pane\]' "$ARGV_LOG"
-  refute test -e "$mine"
+  refute grep -q 'did not name or record' <<<"$output"
+  refute test -e "$stale"
+  grep -q '^tmux:/tmp/fake:%1	/proj/MINE	claude-code$' "$mine"
 
   # Control: a genuine other seat gets no such hint.
   rm -f "$stale"
@@ -3726,11 +3923,42 @@ _tmux_op_args() {
   printf 'tmux:/tmp/fake:%%1\t/proj/PEER\tclaude-code\n' > "$rival"
   run agmsg_terminal_name_self "" seatteam alice /proj/MINE claude-code record
   grep -q "recorded as seatteam__bob's" <<<"$output"
-  refute grep -q 'remove run/spawn' <<<"$output"
+  refute grep -q 'no longer exists' <<<"$output"
+
+  # No proof the team is gone, no drop: a name without a team/agent split, and
+  # a teams directory that cannot be listed, both keep the claimant.
+  rm -f "$rival"
+  local nosplit; nosplit="$(dirname "$mine")/spawn.unsplittable"
+  printf 'tmux:/tmp/fake:%%1\t/proj/PEER\tclaude-code\n' > "$nosplit"
+  run agmsg_terminal_name_self "" seatteam alice /proj/MINE claude-code record
+  grep -q "recorded as unsplittable's" <<<"$output"
+  test -e "$nosplit"
+  rm -f "$nosplit"
+  printf 'tmux:/tmp/fake:%%1\t/proj/PEER\tclaude-code\n' > "$stale"
+  chmod 111 "$SKILL_DIR/teams"
+  run agmsg_terminal_name_self "" seatteam alice /proj/MINE claude-code record
+  chmod 755 "$SKILL_DIR/teams"
+  grep -q "recorded as gone__alice's" <<<"$output"
+  test -e "$stale"
+
+  # The record is re-read before it is dropped: one that moved to another pane
+  # while the owner was being looked up is not the record that was judged.
+  chmod 755 "$SKILL_DIR/teams"
+  # The record moves during the LAST owner lookup, the one right before removal.
+  _agmsg_placement_claimant_here_now() {
+    if [ -e "$BATS_TEST_TMPDIR/asked" ]; then
+      printf 'tmux:/tmp/fake:%%2\t/proj/LIVE\tclaude-code\n' > "$stale"
+    fi
+    : > "$BATS_TEST_TMPDIR/asked"
+    echo unknown
+  }
+  run agmsg_terminal_name_self "" seatteam alice /proj/MINE claude-code record
+  test -e "$stale"
+  grep -q '%2' "$stale"
 }
 
 @test "placement guard: a claimant whose session is confirmed gone lets a live seat take the pane; a claimant still there still refuses (#1485)" {
-  # elder's Codex session ended; resumer's fresh session now sits in the same
+  # elder's session ended; resumer's fresh session now sits in the same
   # herdr pane. elder's spawn record still claims it (first-writer-wins,
   # #1114), but elder's own role-session record names the session that used
   # to hold it.
@@ -3742,8 +3970,8 @@ _tmux_op_args() {
 
   local rival; rival="$(agmsg_spawn_path seatteam elder)"
   mkdir -p "$(dirname "$rival")"
-  printf 'herdr:%s:wC:p4\t/proj/OLD\tcodex\n' "$HERDR_SOCKET_PATH" > "$rival"
-  agmsg_role_session_record seatteam elder old-sid /proj/OLD codex
+  printf 'herdr:%s:wC:p4\t/proj/OLD\tclaude-code\n' "$HERDR_SOCKET_PATH" > "$rival"
+  agmsg_role_session_record seatteam elder old-sid /proj/OLD claude-code
   agmsg_role_session_mark_named seatteam elder "herdr:$HERDR_SOCKET_PATH:wC:p4" 1
 
   local mine; mine="$(agmsg_spawn_path seatteam resumer)"
@@ -3792,6 +4020,34 @@ _tmux_op_args() {
   cmp -s "$ghost_role" <(printf 'session=ghost-sid\nname=x\nteam=x\nagent=x\ntype=codex\nproject=/proj/GHOST\n')
 }
 
+@test "placement guard: a Codex claimant is never read as gone from herdr's agent list (it cannot answer for those threads)" {
+  export HERDR_ENV=1 HERDR_PANE_ID='wC:p4'
+  unset TMUX TMUX_PANE
+  export AGMSG_TERMINAL_DRIVER=herdr
+  source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+  source "$SKILL_DIR/scripts/lib/role-session.sh"
+
+  local rival; rival="$(agmsg_spawn_path seatteam elder)"
+  mkdir -p "$(dirname "$rival")"
+  printf 'herdr:%s:wC:p4\t/proj/OLD\tcodex\n' "$HERDR_SOCKET_PATH" > "$rival"
+  agmsg_role_session_record seatteam elder old-sid /proj/OLD codex
+  agmsg_role_session_mark_named seatteam elder "herdr:$HERDR_SOCKET_PATH:wC:p4" 1
+  local mine; mine="$(agmsg_spawn_path seatteam resumer)"
+
+  # Same lists that let a non-Codex claimant be taken over: the claimant's
+  # session is absent, the asking seat's own is listed at the pane.
+  _fake_herdr_list_two_sessions "" "" my-sid wC:p4
+  run agmsg_terminal_name_self "my-sid" seatteam resumer /proj/MINE codex record
+  [ "$status" -eq 0 ]
+  grep -q "recorded as seatteam__elder's" <<<"$output"
+  # Not a silent refusal: the reason and the way out are both printed.
+  grep -q "Codex seat" <<<"$output"
+  grep -q "cannot be read from the terminal" <<<"$output"
+  grep -q "drop or despawn that seat" <<<"$output"
+  refute test -e "$mine"
+  [ "$(agmsg_role_session_named seatteam elder)" = "$(printf 'herdr:%s:wC:p4\t1' "$HERDR_SOCKET_PATH")" ]
+}
+
 # --- #1112: a seat identifies its own pane by its LABEL ------------------------
 
 #
@@ -3830,6 +4086,8 @@ $(for pair in "$@"; do id="${pair%%=*}"; label="${pair#*=}"
   esac
 elif [ "\$1" = agent ] && [ "\$2" = list ]; then
   printf '{"id":"1","result":{"type":"list","agents":[]}}\n'
+elif [ "\$1" = agent ] && [ "\$2" = get ]; then
+  printf '{"result":{"agent":{"pane_id":"%s"}}}\n' "\$3"
 elif [ "\$1" = pane ] && [ "\$2" = rename ]; then exit 0
 elif [ "\$1" = agent ] && [ "\$2" = rename ]; then exit 0
 fi
@@ -3974,6 +4232,10 @@ EOF
   [ "$(terminal_self_env)" = "$CODEX_THREAD_ID" ]
   [ "$(terminal_where "$CODEX_THREAD_ID")" = n/a:no_container_concept ]
   [ "$(agmsg_terminal_get codex-app capabilities)" = where ]
+  # No instance to add, and nothing said about it on every command.
+  run agmsg_terminal_ref_qualify "codex-app:$CODEX_THREAD_ID"
+  [ "$status" -eq 0 ]
+  [ "$output" = "codex-app:$CODEX_THREAD_ID" ]
   local verb
   for verb in spawn despawn peek poke arrange name pane_state; do
     run "terminal_$verb" "$CODEX_THREAD_ID"
@@ -4376,6 +4638,9 @@ if [ "$1" = agent ] && [ "$2" = rename ]; then
   echo 'herdr: pane w1:pX is gone' >&2
   exit 4
 fi
+if [ "$1" = agent ] && [ "$2" = get ]; then
+  echo '{"result":{"agent":{"pane_id":"w1:pX"}}}'
+fi
 exit 0
 EOF
   chmod +x "$FAKEBIN/herdr"
@@ -4396,6 +4661,9 @@ EOF
   # -- which is the state #1127 is about.
   cat > "$FAKEBIN/herdr" <<'EOF'
 #!/usr/bin/env bash
+if [ "$1" = agent ] && [ "$2" = get ]; then
+  echo '{"result":{"agent":{"pane_id":"w1:pX"}}}'
+fi
 exit 0
 EOF
   chmod +x "$FAKEBIN/herdr"
